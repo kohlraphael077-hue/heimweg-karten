@@ -1,0 +1,76 @@
+# Baut jede Woche die Heimweg-Kartendaten neu und veröffentlicht sie auf GitHub Pages.
+# Manuell starten: Actions → „Kartendaten bauen“ → „Run workflow“.
+name: Kartendaten bauen
+
+on:
+  schedule:
+    - cron: "17 3 * * 1" # jeden Montag um 03:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Werkzeuge installieren
+        run: sudo apt-get update -q && sudo apt-get install -y -q osmium-tool
+
+      - name: Kartenauszüge herunterladen (Geofabrik)
+        run: |
+          mkdir -p raw
+          for r in europe/austria europe/switzerland europe/liechtenstein; do
+            name=$(basename $r)
+            curl -sSfL --retry 3 -o raw/$name.osm.pbf https://download.geofabrik.de/$r-latest.osm.pbf
+          done
+          ls -lh raw
+
+      - name: Nur die nötigen Objekte herausfiltern
+        run: |
+          mkdir -p work
+          for f in raw/*.osm.pbf; do
+            name=$(basename $f .osm.pbf)
+            osmium tags-filter "$f" \
+              w/lit=yes,24/7,automatic,sunset-sunrise,limited \
+              w/highway=residential,living_street,pedestrian,tertiary,secondary,primary,unclassified \
+              w/landuse=residential,commercial,retail \
+              nwr/amenity=police,fuel,hospital,taxi,pharmacy,fast_food,restaurant,bar,pub,cafe,nightclub \
+              nw/tourism=hotel,hostel \
+              nw/shop=convenience,supermarket,kiosk \
+              nw/railway=station nw/public_transport=station \
+              -o work/$name.filtered.pbf --overwrite
+            osmium export work/$name.filtered.pbf -f geojsonseq -a type,id \
+              --geometry-types=point,linestring,polygon -o work/$name.geojsonseq --overwrite
+            ls -lh work/$name.geojsonseq
+          done
+
+      - name: Kacheln bauen
+        run: |
+          export BUILD_DATE=$(date -u +%Y-%m-%d)
+          python3 build/build_tiles.py site AT,CH,LI work/*.geojsonseq
+          cp site-static/* site/ 2>/dev/null || true
+          du -sh site
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
